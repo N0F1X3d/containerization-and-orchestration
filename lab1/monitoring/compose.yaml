@@ -1,0 +1,42 @@
+# Стек мониторинга для части 8: api под теми же лимитами + cAdvisor + Prometheus + Grafana.
+services:
+  api:
+    build: ../api            # multi-stage образ из части 6
+    image: api:multi
+    container_name: api
+    ports: ["8080:8080"]
+    mem_limit: 100m          # те же лимиты, что в частях 3 и 5
+    memswap_limit: 100m      # = без свопа
+    cpus: 0.5
+    pids_limit: 50
+    restart: unless-stopped  # после OOM поднимется заново — увидим рестарт на графике
+
+  cadvisor:                  # читает cgroup-файлы всех контейнеров и отдаёт их как метрики
+    image: ghcr.io/google/cadvisor:v0.60.6
+    command: ["--docker_only=true", "--housekeeping_interval=5s", "--store_container_labels=false", "--enable_metrics=cpu,memory,oom_event,process,pressure"]
+    privileged: true
+    devices: ["/dev/kmsg"]   # отсюда cAdvisor узнаёт про OOM-kill
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports: ["8088:8080"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/api.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
