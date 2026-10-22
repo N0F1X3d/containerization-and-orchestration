@@ -186,6 +186,42 @@ bash -c "echo \$\$ | sudo tee $CG/cgroup.procs >/dev/null; exec ./api"
 
 ## Часть 4 — права
 
+Namespaces прячут, cgroups ограничивают объём, а тут ограничиваем, **что процесс вообще может сделать**. Два отдельных механизма.
+
+### Capabilities
+
+Обычный root время менять может, а тот же root, у которого из bounding set выкинут `CAP_SYS_TIME`, — уже нет:
+
+![capabilities](screenshots/12_part4_caps.png)
+
+```bash
+sudo capsh --drop=cap_sys_time -- -c 'date -s "$(date)"; grep CapBnd /proc/self/status'
+```
+
+`CapBnd` был `000001ffffffffff`, стал `000001fffdffffff` — пропал ровно один бит (25-й, это `CAP_SYS_TIME`). Ядро проверяет не «uid == 0», а конкретный бит, поэтому root без бита — не может. Docker делает так же, только оставляет контейнеру ~14 capabilities из 41 и выкидывает всё опасное (`SYS_ADMIN`, `SYS_TIME`, `SYS_MODULE`, ...).
+
+### Seccomp
+
+Seccomp — фильтр системных вызовов: процесс зовёт функцию ядра, а фильтр отвечает «нельзя» ещё до того, как ядро начнёт её выполнять. Навесил через `systemd-run` (systemd сам умеет ставить seccomp) запрет на `unshare`, `setns`, `mount` — ровно то, чем я строил «контейнер» в части 2:
+
+```bash
+sudo systemd-run --quiet --wait --pipe --collect --uid=dev \
+  -p SystemCallFilter="~unshare setns mount" -p SystemCallErrorNumber=EPERM \
+  bash -c 'grep Seccomp /proc/self/status; unshare -Ur true; mkdir -p /tmp/x && echo "mkdir работает"'
+```
+
+![seccomp](screenshots/13_part4_seccomp.png)
+
+`Seccomp: 2` — включён режим фильтра. `unshare` получил `Operation not permitted`, а `mkdir`, который не запрещали, работает.
+
+### Что закрывает каждый механизм
+
+- **Capabilities** — проверяют, разрешено ли **привилегированное действие** (менять время, монтировать, грузить модули ядра). Режу именно **bounding set**: это потолок, его нельзя поднять обратно, даже запустив setuid-бинарник вроде `sudo`. Если убрать capability только из effective, она останется в permitted и процесс сможет включить её себе обратно.
+- **Seccomp** — режет **сами системные вызовы**, ещё до их выполнения, причём любые, а не только привилегированные. Это важно, потому что дыры бывают и в коде вызовов, которым никакие права не нужны. Меньше доступных вызовов — меньше поверхность атаки на ядро.
+- Зачем контейнеру запрещать `unshare`/`mount`, если он и так в своих namespaces: `unshare` (создать себе user namespace и получить в нём `CAP_SYS_ADMIN`) — классический первый шаг эксплойтов побега из контейнера (например CVE-2022-0185). Нет вызова — до уязвимого кода не добраться.
+
+Нужны оба: capabilities не закроют непривилегированные вызовы, а seccomp не различает, *кто* зовёт — только *что*.
+
 ## Часть 5 — свой Docker (`mydocker.sh`) против `docker run`
 
 ## Часть 6 — образы
