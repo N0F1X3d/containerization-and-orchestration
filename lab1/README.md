@@ -224,6 +224,58 @@ sudo systemd-run --quiet --wait --pipe --collect --uid=dev \
 
 ## Часть 5 — свой Docker (`mydocker.sh`) против `docker run`
 
+Собрал всё из частей 2–4 в один скрипт: [`mydocker.sh`](mydocker.sh).
+
+```bash
+./mydocker.sh run box                 # запустить api в «контейнере»
+./mydocker.sh exec box curl -s localhost:8080/health   # как docker exec (через nsenter)
+```
+
+Что он делает по порядку:
+
+1. **cgroup** `/sys/fs/cgroup/mydocker-box` с лимитами памяти, CPU и pids (часть 3), при выходе удаляет её;
+2. шелл кладёт себя в cgroup и делает `exec unshare --user --map-root-user --pid --fork --mount-proc --net --uts --ipc` — свои namespaces (часть 2);
+3. внутри: hostname, поднять `lo`;
+4. последним шагом `setpriv --bounding-set=-all --inh-caps=-all --no-new-privs --seccomp-filter seccomp.bpf ./api` — пустые capabilities, запрет повышать права и seccomp (часть 4).
+
+Seccomp навешивается **последним**, после `unshare` и `mount` — иначе профиль запретил бы мой же `unshare`. Поэтому не через `systemd-run`, как в части 4, а через `setpriv`. `setpriv` понимает только скомпилированный BPF, а профиль у меня в формате Docker — [`seccomp.json`](seccomp.json) (запрещает `unshare`, `setns`, `mount`, `ptrace`, загрузку модулей, `bpf`, `keyctl` и т. п.). Чтобы один и тот же профиль работал и в скрипте, и в `docker run`, написал маленький конвертер [`seccompgen`](seccompgen/main.go): JSON → BPF.
+
+![mydocker.sh](screenshots/14_part5_mydocker.png)
+
+Внутри `api` — PID 1 и `/health` отвечает. Снаружи: uid 502, `CapBnd` из нулей, `NoNewPrivs: 1`, `Seccomp: 2`.
+
+Тот же бинарник, те же лимиты и тот же seccomp-профиль через Docker:
+
+```bash
+docker run -d --name api-docker -v $PWD/api:/app:ro --memory 100m --cpus 0.5 --pids-limit 50 \
+  --security-opt seccomp=$PWD/seccomp.json -p 8081:8080 busybox /app/api
+```
+
+![docker run](screenshots/15_part5_docker.png)
+
+### Сравнение
+
+| | `mydocker.sh` | `docker run` |
+|---|---|---|
+| pid, mount, net, uts, ipc namespaces | ✅ | ✅ |
+| user namespace | ✅ root внутри = uid 502 снаружи | ❌ по умолчанию нет — **снаружи настоящий root (uid 0)** |
+| cgroup namespace | ❌ процесс видит путь своей cgroup на хосте | ✅ внутри `/proc/1/cgroup` = `0::/` |
+| лимиты cgroup | ✅ сам пишу в файлы | ✅ те же файлы, только в `system.slice/docker-<id>.scope` |
+| capabilities | 0 из 41 | 14 из 41 (`chown`, `setuid`, `net_bind_service`, `kill`, ...) |
+| no_new_privs | ✅ | ❌ (включается `--security-opt no-new-privileges`) |
+| seccomp | ✅ мой профиль | ✅ мой профиль (без `--security-opt` — встроенный дефолтный) |
+| своя файловая система | ❌ виден весь хост | ✅ корень из образа (`ls /` — это busybox) через overlayfs + `pivot_root` |
+| сеть | ❌ только `lo`, снаружи не достучаться | ✅ veth `eth0` → мост `docker0`, IP 172.17.0.2, NAT наружу и `-p 8081:8080` внутрь |
+| образы, логи, рестарты, `docker ps` | ❌ | ✅ |
+
+### Выводы
+
+- **Главное отличие — uid снаружи.** У Docker `api` на хосте — настоящий root. Если через баг ядра процесс сбежит из контейнера, он окажется root на хосте. Мой скрипт за счёт user namespace сбежит максимум как обычный юзер 502.
+- **Почему Docker не включает user namespace по умолчанию:** ломаются тома. С маппингом `0 100000 65536` файл, созданный root в контейнере, на хосте принадлежит uid 100000, а хостовый файл юзера 1000 (которого нет в маппинге) внутри выглядит как `nobody` и не пишется. Поэтому user namespace включают явно — `userns-remap` или rootless Docker.
+- **Почему у Docker 14 capabilities, а не 0:** обычным образам они нужны. Например, nginx/postgres стартуют от root и сами переключаются на непривилегированного юзера (`CAP_SETUID`/`CAP_SETGID`), меняют владельца своих файлов (`CAP_CHOWN`, `CAP_FOWNER`), nginx слушает порт 80 (`CAP_NET_BIND_SERVICE`). Опасное (`SYS_ADMIN`, `SYS_MODULE`, `SYS_TIME`) Docker выкидывает. Мне для `api` не нужно ничего — поэтому 0.
+- **Сеть у Docker:** `eth0` в контейнере — конец veth-пары (`eth0@if6` = «моя пара — интерфейс №6 на хосте»), второй конец воткнут в мост `docker0` (172.17.0.1 — шлюз контейнера). Наружу — NAT (masquerade) подменяет 172.17.0.2 на адрес хоста. Внутрь — `-p 8081:8080` это DNAT-правило (плюс `docker-proxy` для localhost), которое превращает `localhost:8081` в `172.17.0.2:8080`. У моего скрипта этого нет — только `lo`.
+- **Файловая система:** Docker даёт контейнеру корень из образа (overlayfs + `pivot_root`), а мой скрипт оставляет хостовую ФС — это и есть то, чего не хватает (часть 6).
+
 ## Часть 6 — образы
 
 ## Часть 7 — gVisor

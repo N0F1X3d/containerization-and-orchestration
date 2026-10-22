@@ -1,2 +1,4 @@
 api/api
+seccompgen/seccompgen
+seccomp.bpf
 .DS_Store
