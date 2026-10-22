@@ -1,0 +1,7 @@
+# Для сравнения: одна стадия — в итоговом образе остаётся весь тулчейн Go.
+FROM golang:1.25-alpine
+WORKDIR /src
+COPY . .
+RUN go build -o /api .
+EXPOSE 8080
+ENTRYPOINT ["/api"]

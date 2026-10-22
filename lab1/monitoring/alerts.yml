@@ -1,0 +1,27 @@
+groups:
+  - name: api
+    rules:
+      # 1. Память близко к лимиту — следующий шаг OOM-kill.
+      - alert: ApiMemoryNearLimit
+        expr: container_memory_working_set_bytes{name="api"} / container_spec_memory_limit_bytes{name="api"} > 0.8
+        for: 30s
+        labels: {severity: warning}
+        annotations:
+          summary: "api использует {{ $value | humanizePercentage }} лимита памяти — скоро OOM-kill"
+
+      # 2. CPU душат больше чем в половине периодов — растёт latency.
+      - alert: ApiCPUThrottled
+        expr: |
+          rate(container_cpu_cfs_throttled_periods_total{name="api"}[1m])
+            / rate(container_cpu_cfs_periods_total{name="api"}[1m]) > 0.5
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "api придушен в {{ $value | humanizePercentage }} CPU-периодов — сервис тормозит"
+
+      # 3. Контейнер убит по OOM — сервис уже падал.
+      - alert: ApiOOMKilled
+        expr: increase(container_oom_events_total{name="api"}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "api убит OOM killer за последние 5 минут"
