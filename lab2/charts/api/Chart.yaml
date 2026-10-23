@@ -1,0 +1,6 @@
+apiVersion: v2
+name: api
+description: Тестовый сервис лабы 2 + его мониторинг (ServiceMonitor, дашборд, алерты)
+type: application
+version: 0.1.0
+appVersion: "lab2"

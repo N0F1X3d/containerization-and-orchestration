@@ -1,0 +1,11 @@
+{{- if .Values.dashboard.enabled }}
+# Grafana-sidecar подхватывает ConfigMap'ы с лейблом grafana_dashboard=1 из всех namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-dashboard
+  labels: {grafana_dashboard: "1"}
+data:
+  api-red.json: |-
+{{ tpl (.Files.Get "files/api-red.json") . | indent 4 }}
+{{- end }}

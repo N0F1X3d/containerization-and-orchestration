@@ -1,0 +1,15 @@
+{{- if .Values.serviceMonitor.enabled }}
+# Говорит Prometheus Operator'у: скрейпь порт http у сервисов с этим лейблом, путь /metrics.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api
+  labels: {app.kubernetes.io/name: api}
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: api}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+{{- end }}

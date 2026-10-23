@@ -1,0 +1,5 @@
+apiVersion: v2
+name: alert-receiver
+description: Получатель вебхуков Alertmanager — пишет каждое уведомление в свой лог
+type: application
+version: 0.1.0

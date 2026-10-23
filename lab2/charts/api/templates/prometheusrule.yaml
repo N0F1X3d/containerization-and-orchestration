@@ -1,0 +1,41 @@
+{{- if .Values.alerts.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api
+  labels: {app.kubernetes.io/name: api}
+spec:
+  groups:
+    - name: api
+      rules:
+        # 1. Пользователи получают ошибки.
+        - alert: ApiHighErrorRate
+          expr: |
+            sum(rate(http_request_errors_total{job="api"}[1m]))
+              / sum(rate(http_requests_total{job="api"}[1m])) > {{ .Values.alerts.errorRate }}
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "api: {{`{{ $value | humanizePercentage }}`}} запросов заканчиваются 5xx"
+            runbook: "Смотреть логи level=error в Grafana → по trace_id открыть трейс в Jaeger → найти упавшую зависимость."
+
+        # 2. Пользователи ждут слишком долго.
+        - alert: ApiHighLatencyP95
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{job="api", path!="/load"}[1m]))) > {{ .Values.alerts.latencyP95 }}
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "api: p95 времени ответа {{`{{ $value | humanizeDuration }}`}}"
+            runbook: "Открыть медленные трейсы в Jaeger (min duration 1s) → какой спан съел время → проверить нагрузку и CPU-throttling пода."
+
+        # 3. Сервиса нет вообще.
+        - alert: ApiDown
+          expr: absent(up{job="api"} == 1)
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "api: ни один под не отвечает на скрейп"
+            runbook: "kubectl get pods -l app.kubernetes.io/name=api, describe/logs: CrashLoop? OOMKilled? Scale 0? Проверить последний деплой."
+{{- end }}

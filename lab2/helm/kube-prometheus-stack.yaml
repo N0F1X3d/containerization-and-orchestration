@@ -1,0 +1,59 @@
+# kube-prometheus-stack: Prometheus Operator + Prometheus + Alertmanager + Grafana (+ node-exporter, kube-state-metrics).
+fullnameOverride: kps
+
+# Компоненты control plane в kind не скрейпятся снаружи — выключаем, чтобы не было ложных алертов/ошибок.
+kubeEtcd: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeProxy: {enabled: false}
+# Встроенные правила (их ~150) тоже выключаем — в Alertmanager/Karma будут только наши три алерта.
+defaultRules: {create: false}
+
+prometheus:
+  prometheusSpec:
+    # По умолчанию Prometheus берёт только ServiceMonitor/PrometheusRule с лейблами своего релиза.
+    # false = брать все из всех namespace — тогда подхватятся ресурсы из чарта api.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    retention: 2d
+
+# Часть 4: куда Alertmanager отправляет алерты.
+alertmanager:
+  config:
+    route:
+      receiver: webhook
+      group_by: [alertname]
+      group_wait: 10s        # подождать, вдруг прилетят ещё алерты той же группы
+      group_interval: 1m
+      repeat_interval: 1h    # повторять, пока горит
+      routes: []             # убрать дефолтные маршруты чарта (они ссылаются на receiver "null")
+    receivers:
+      - name: webhook
+        webhook_configs:
+          - url: http://alert-receiver.lab2.svc:8080/alertmanager
+            send_resolved: true
+
+grafana:
+  adminPassword: admin
+  grafana.ini:
+    auth.anonymous: {enabled: true, org_role: Admin}
+  sidecar:
+    dashboards:
+      searchNamespace: ALL   # подхватывать дашборды (ConfigMap с grafana_dashboard=1) из всех namespace
+  # Часть 2: Loki как второй источник в той же Grafana — метрики и логи в одном окне.
+  additionalDataSources:
+    - name: Loki
+      uid: loki
+      type: loki
+      url: http://loki.monitoring:3100
+      jsonData:
+        # Часть 3: trace_id в JSON-логе превращается в ссылку на этот трейс в Jaeger UI.
+        # (Встроенный Jaeger-источник Grafana ходит в старый API /api/services, которого в Jaeger 2.22 уже нет.)
+        derivedFields:
+          - name: trace_id
+            matcherRegex: '"trace_id":"(\w+)"'
+            url: 'http://localhost:16686/trace/$${__value.raw}'
+            urlDisplayLabel: Открыть трейс в Jaeger
