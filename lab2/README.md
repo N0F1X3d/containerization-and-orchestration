@@ -140,3 +140,73 @@ helm upgrade api charts/api -n lab2 --reuse-values --set otlpEndpoint=http://jae
 - **Как читать водопад.** Если бы `GET /slow` длился 3 с, а вложенный `slow-op` — 0.5 с, значит 2.5 с ушли в код, который не обёрнут ни в один спан. Лечится добавлением спанов на остальные шаги обработчика — тогда «дыра» разобьётся на части и станет видно, какая съела время.
 - **Кто на какой вопрос отвечает.** Метрики — *что-то не так*: когда и насколько (ошибки подскочили в 21:30). Логи — *что именно* случилось (`database unavailable`). Трейсы — *где, на каком шаге* (какой спан красный/длинный). Путь дежурного: график RED → логи за это время с `level=ERROR` → `trace_id` из строки → трейс в Jaeger → причина.
 - **Как трейс проходит через несколько запросов.** `/load` делает 50 запросов к себе, а в Jaeger это **один** трейс (корень `GET /load` + по паре спанов «клиент `HTTP GET` / сервер `GET /health`» на каждый запрос — проверил на `n=5`: 11 спанов, 1 trace_id). Клиент `otelhttp` кладёт в каждый исходящий запрос заголовок `traceparent: 00-<trace_id>-<span_id>-01`, сервер его читает и создаёт свой спан дочерним к спану клиента, с тем же `trace_id`. Это context propagation — так трейс идёт через цепочку разных сервисов.
+
+## Часть 4 — алерты (Alertmanager + Karma)
+
+Цепочка:
+
+- **Prometheus** считает правила (PromQL). Условие выполнилось → алерт **pending**; продержалось дольше `for:` → **firing** и уходит в Alertmanager;
+- **Alertmanager** группирует алерты (`group_by: [alertname]`), убирает дубли и рассылает получателю. Получатель — вебхук на маленький echo-сервер [`alert-receiver`](charts/alert-receiver/templates/receiver.yaml), который пишет каждое уведомление в свой лог. Маршрут и получатель — `alertmanager.config` в [`helm/kube-prometheus-stack.yaml`](helm/kube-prometheus-stack.yaml);
+- **Karma** ([`helm/karma.yaml`](helm/karma.yaml)) — дашборд поверх Alertmanager: все активные алерты в одном окне, с группировкой и фильтрами.
+
+```bash
+helm install alert-receiver charts/alert-receiver -n lab2 --wait
+helm upgrade api charts/api -n lab2 --reuse-values --set alerts.enabled=true
+helm install karma wiremind/karma --version 2.13.1 -n monitoring -f helm/karma.yaml --wait
+```
+
+Грабли: Alertmanager сначала не поднялся — Helm слил мой `alertmanager.config` с дефолтным, и из дефолтного остались маршруты на receiver `"null"`, которого в моём списке нет (`undefined receiver "null" used in route`). Помогло `routes: []`.
+
+### Три критичных алерта
+
+Правила — [`charts/api/templates/prometheusrule.yaml`](charts/api/templates/prometheusrule.yaml), у каждого `summary` (что случилось, с цифрой) и `runbook` (что делать дежурному).
+
+| Алерт | Условие | Что ловит | Почему важно | Что делать дежурному |
+|---|---|---|---|---|
+| `ApiHighErrorRate` | доля 5xx > 5% дольше 1 мин | пользователи получают ошибки | это прямая боль пользователя: запросы не выполняются | логи `level=ERROR` в Grafana → `trace_id` → трейс в Jaeger → какая зависимость упала |
+| `ApiHighLatencyP95` | p95 > 1 с дольше 1 мин (без `/load`) | пользователи ждут слишком долго | сервис формально жив, но медленный — люди уходят, у клиентов срабатывают таймауты | медленные трейсы в Jaeger (min duration 1s) → какой спан съел время → нагрузка, CPU-throttling пода |
+| `ApiDown` | `absent(up{job="api"} == 1)` дольше 1 мин | ни один под не отвечает | сервиса нет вообще — 100% отказ | `kubectl get pods`, `describe`, `logs`: CrashLoop? OOMKilled? scale 0? последний деплой |
+
+### Ошибки и задержка
+
+2.5 минуты гонял `/fail` + `/health` и параллельно `/slow`:
+
+![алерты в Prometheus](screenshots/08_part4_prom_alerts.png)
+
+![Alertmanager](screenshots/09_part4_alertmanager.png)
+
+![Karma](screenshots/10_part4_karma.png)
+
+В Karma у каждого алерта видно `summary` с живыми цифрами (32.85% запросов 5xx, p95 2.7 с) и `runbook`.
+
+Уведомления дошли до получателя — и `firing`, и `resolved` (когда нагрузка закончилась, Alertmanager прислал «отбой», потому что `send_resolved: true`):
+
+![получатель](screenshots/11_part4_receiver.png)
+
+### Сервис упал целиком
+
+`kubectl -n lab2 scale deploy/api --replicas=0` — через ~2 минуты загорелся `ApiDown`, а два других погасли (нет сервиса — нет и запросов):
+
+![ApiDown](screenshots/12_part4_apidown.png)
+
+### Что понял
+
+- **Почему при `replicas=0` погасли алерты на ошибки и задержку.** Нет сервиса — нет запросов, доля ошибок становится 0/0, то есть «нет данных», и алерт гаснет. Тишина в алертах об ошибках не значит «всё хорошо» — поэтому нужен отдельный алерт на то, что сервиса нет вообще.
+- **Почему `absent(up{job="api"} == 1)`, а не `up == 0`.** Когда подов нет, пропадает и таргет — ряда `up{job="api"}` просто не существует, и `up == 0` не сработает никогда. `absent(...)` ловит именно отсутствие ряда. А `== 1` внутри заодно покрывает случай «под есть, но на скрейп не отвечает» (`up = 0`).
+- **Зачем Alertmanager, если Prometheus сам считает алерты.** Prometheus только вычисляет условия. Alertmanager группирует (одно уведомление на группу вместо сотни, `group_by`/`group_wait`), убирает дубли, маршрутизирует по получателям, не спамит повторами (`repeat_interval`), присылает отбой (`send_resolved`), умеет silences — временно заглушить алерты на время работ.
+
+## Итог
+
+Весь стек в Kubernetes, всё через Helm:
+
+| Компонент | Чарт / values | Роль |
+|---|---|---|
+| `api` + ServiceMonitor + дашборд + правила | [`charts/api`](charts/api) | сервис и всё, что описывает его мониторинг |
+| Prometheus, Alertmanager, Grafana, Prometheus Operator | `prometheus-community/kube-prometheus-stack` + [`helm/kube-prometheus-stack.yaml`](helm/kube-prometheus-stack.yaml) | метрики, алерты, визуализация |
+| Loki | `grafana/loki` + [`helm/loki.yaml`](helm/loki.yaml) | хранилище логов |
+| Alloy (DaemonSet) | `grafana/alloy` + [`helm/alloy.yaml`](helm/alloy.yaml) | сбор логов с нод |
+| Jaeger | `jaegertracing/jaeger` + [`helm/jaeger.yaml`](helm/jaeger.yaml) | приём и просмотр трейсов |
+| Karma | `wiremind/karma` + [`helm/karma.yaml`](helm/karma.yaml) | дашборд алертов |
+| alert-receiver | [`charts/alert-receiver`](charts/alert-receiver) | получатель вебхуков Alertmanager |
+
+Проверка «всё связано»: `/load`, `/fail`, `/slow` → реагирует дашборд RED → в Grafana находится лог ошибки → по `trace_id` из лога открывается тот же трейс в Jaeger (медленный `slow-op`, красный `/fail`) → по трём правилам алерты уходят в firing и видны в Prometheus, Alertmanager, Karma и у получателя.
