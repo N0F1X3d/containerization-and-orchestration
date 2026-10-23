@@ -1,0 +1,3 @@
+# Jaeger v2 all-in-one: приём OTLP (4317 gRPC / 4318 HTTP), хранение в памяти, UI на 16686.
+jaeger:
+  replicas: 1

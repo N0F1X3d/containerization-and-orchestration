@@ -1,0 +1,26 @@
+image:
+  repository: api
+  tag: lab2
+  pullPolicy: Never        # образ загружаем в kind сами (kind load), из registry не тянем
+
+replicas: 1
+
+# Куда слать трейсы по OTLP/HTTP (часть 3). Пусто — трейсы никуда не уходят.
+otlpEndpoint: ""
+
+resources:
+  requests: {cpu: 50m, memory: 32Mi}
+  limits: {cpu: 500m, memory: 128Mi}
+
+# Часть 1: Prometheus находит сервис через ServiceMonitor, Grafana подхватывает дашборд из ConfigMap.
+serviceMonitor:
+  enabled: false
+dashboard:
+  enabled: false
+  logsPanel: false         # часть 2: панель логов из Loki на том же дашборде
+
+# Часть 4: правила алертов (PrometheusRule).
+alerts:
+  enabled: false
+  errorRate: 0.05          # доля 5xx
+  latencyP95: 1            # секунды
