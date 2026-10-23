@@ -142,6 +142,13 @@ func load(self string) http.HandlerFunc {
 }
 
 func setupTracing(ctx context.Context) (func(context.Context) error, error) {
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	// Адрес не задан — трейсы никуда не шлём (иначе экспортёр долбится в localhost:4318 и сыплет ошибками).
+	// Спаны всё равно создаются, поэтому trace_id в логах есть всегда.
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
+		otel.SetTracerProvider(sdktrace.NewTracerProvider())
+		return func(context.Context) error { return nil }, nil
+	}
 	// Адрес берётся из OTEL_EXPORTER_OTLP_ENDPOINT, имя сервиса — из OTEL_SERVICE_NAME.
 	exp, err := otlptracehttp.New(ctx)
 	if err != nil {
@@ -149,7 +156,6 @@ func setupTracing(ctx context.Context) (func(context.Context) error, error) {
 	}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp))
 	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.TraceContext{})
 	return tp.Shutdown, nil
 }
 

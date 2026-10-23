@@ -21,8 +21,6 @@ spec:
             - {name: OTEL_SERVICE_NAME, value: api}
             {{- with .Values.otlpEndpoint }}
             - {name: OTEL_EXPORTER_OTLP_ENDPOINT, value: {{ . | quote }}}
-            {{- else }}
-            - {name: OTEL_TRACES_EXPORTER, value: none}
             {{- end }}
           readinessProbe:
             httpGet: {path: /health, port: http}
