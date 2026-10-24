@@ -81,3 +81,69 @@ kubectl create ns shop && for f in policies/bad/*.yaml; do kubectl apply -f $f; 
 - **Когда проверяет Kyverno.** До etcd: admission стоит между аутентификацией и сохранением объекта. Не прошёл проверку — объекта в кластере просто нет. Уже работающие поды новая политика не трогает (не убивает) — они только попадают в фоновый отчёт (PolicyReport).
 - **Зачем `exclude` для инфраструктуры.** Без него упавший под Grafana (образ не из `registry.lab.local`) не смог бы пересоздаться — Deployment есть, подов 0, мониторинг лежит. Поэтому системные namespace исключают или явно добавляют их реестры в доверенные.
 - **Почему важен autogen (правила и для Deployment).** Если бы проверялись только поды: Deployment принят → контроллер ReplicaSet пытается создать поды → вебхук отказывает *контроллеру*, а не мне. `helm install --wait` просто висит до таймаута, подов 0, а причина видна только в events ReplicaSet (`FailedCreate ... denied the request`). С autogen отказ приходит сразу на `apply`/`helm install`.
+
+## Часть 2 — чарт `shop`
+
+Чарт — [`charts/shop`](charts/shop): `Chart.yaml`, [`values.yaml`](charts/shop/values.yaml) (api — 3 реплики, worker — 2), шаблоны [`api.yaml`](charts/shop/templates/api.yaml) и [`worker.yaml`](charts/shop/templates/worker.yaml) (Deployment + Service), readiness- и liveness-пробы на `/health`. Под политики из части 1 заложено сразу (общие куски — в [`_helpers.tpl`](charts/shop/templates/_helpers.tpl)):
+
+- метки `app.kubernetes.io/name` + `app.kubernetes.io/part-of: shop`;
+- `requests`/`limits` из values;
+- образы `registry.lab.local/...` с явным тегом;
+- `securityContext`: `privileged: false`, не root, без повышения прав, read-only ФС, `drop: [ALL]`.
+
+### Политика ловит и чарт
+
+Прогнал чарт с `worker.image.tag=latest` через server-side dry-run (объекты не создаются, но admission проходит по-настоящему):
+
+```bash
+helm template shop charts/shop -n shop --set worker.image.tag=latest | kubectl apply -n shop --dry-run=server -f -
+```
+
+![политика блокирует чарт](screenshots/03_part2_policy_block_chart.png)
+
+Отклонён сам Deployment `shop-worker`, правилом `autogen-explicit-non-latest-tag` — это правило Kyverno сгенерировал из моего правила для Pod. С правильными значениями `helm install` прошёл чисто, без единого отказа.
+
+### Reconciliation
+
+Kubernetes постоянно сравнивает желаемое состояние (spec) с реальным и чинит разницу.
+
+Удалил под `api` руками — ReplicaSet увидел 2 вместо 3 и сразу создал новый:
+
+![под вернулся](screenshots/04_part2_pod_returns.png)
+
+`helm upgrade --set api.replicas=5` — подов стало 5:
+
+![5 реплик](screenshots/05_part2_replicas.png)
+
+### Rolling update без потерь
+
+В Deployment `api` — `strategy: RollingUpdate` с `maxSurge: 1, maxUnavailable: 0`: сначала поднимается **новый** под, и только когда он прошёл readiness — гасится один старый. Рабочих подов никогда не становится меньше нужного.
+
+Запросы шли **изнутри ноды на ClusterIP** сервиса (`docker exec lab-control-plane curl ...`), а не через port-forward — port-forward привязан к одному поду и рвётся, когда этот под заменяют. 300 запросов `/health` + `/version`, параллельно `helm upgrade --set api.image.tag=1.1`:
+
+![rolling ok](screenshots/06_part2_rolling_ok.png)
+
+Ни одного не-200: 25 ответов от старой 1.0, 275 — от новой 1.1. Поды менялись по одному (у новых возраст 80, 77, 62 с — поднимались друг за другом, старые уходили в `Completed`):
+
+![поды при обновлении](screenshots/07_part2_rolling_pods.png)
+
+Грабли: при первом прогоне 1 запрос из 200 всё-таки потерялся. Когда под удаляют, параллельно и несинхронно идут две вещи: (а) kubelet шлёт процессу SIGTERM — `api` закрывает порт; (б) под убирают из Endpoints, и kube-proxy на каждой ноде переписывает iptables (~секунда). Если (а) успело раньше (б) — в этот промежуток новые запросы ещё идут на под с закрытым портом → `connection refused`. Лечится `lifecycle.preStop: sleep 5` — он выполняется **до** SIGTERM: процесс ещё 5 секунд слушает порт и отвечает, а kube-proxy за это время успевает убрать под из маршрутов. После этого — ни одного потерянного запроса.
+
+### Сломанная версия и rollback
+
+`helm upgrade --set api.healthFail=true` — новые поды отвечают на `/health` 503:
+
+![rollout завис](screenshots/08_part2_broken_stuck.png)
+
+- rollout застрял на `Updated: 1/5`: новый под `0/1` (не проходит readiness), а **все 5 старых остались `1/1`** — их не трогают, пока новый не станет Ready;
+- сервис всё это время отвечает `200`;
+- helm по таймауту пометил ревизию 4 как `failed`.
+
+`helm rollback shop 3` — кластер вернулся к рабочей ревизии, появилась ревизия 5 `Rollback to 3`:
+
+![rollback](screenshots/09_part2_rollback.png)
+
+### Что понял
+
+- **readiness vs liveness.** Обе пробы выполняет **kubelet** на ноде, обе смотрят на `/health`, но последствия разные. Провалилась **readiness** → `Ready=false` → под убирают из Endpoints сервиса, трафик на него не идёт, контейнер не трогают. Провалилась **liveness** (у нас 6 раз подряд по 10 с) → kubelet **перезапускает контейнер** — поэтому у сломанного пода `RESTARTS 2`. Readiness — «можно ли слать трафик», liveness — «жив ли процесс или его пора перезапустить».
+- **Почему сломанная версия не уронила сервис.** Две настройки вместе: **readiness-проба** (сломанный под так и не стал Ready) и **`maxUnavailable: 0`** (Deployment не имеет права гасить старый под, пока новый не Ready). Новый не готов → старые не трогаются → rollout просто стоит, сервис работает на старых. Без readiness Kubernetes считал бы под готовым сразу после старта контейнера — rollout заменил бы все 5 старых подов на сломанные, и сервис лёг бы целиком.
