@@ -285,7 +285,7 @@
     {
       "id": 6,
       "type": "timeseries",
-      "title": "Давление и выселения",
+      "title": "Давление по памяти на нодах (1 = MemoryPressure)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -323,16 +323,7 @@
             "uid": "prometheus"
           },
           "expr": "max by (node) (kube_node_status_condition{condition=\"MemoryPressure\", status=\"true\"})",
-          "legendFormat": "MemoryPressure {{node}}"
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum(kube_pod_status_reason{namespace=\"shop\", reason=\"Evicted\"}) or vector(0)",
-          "legendFormat": "выселено подов (Evicted)"
+          "legendFormat": "{{node}}"
         }
       ]
     },

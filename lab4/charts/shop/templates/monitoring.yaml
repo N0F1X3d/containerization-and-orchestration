@@ -88,13 +88,15 @@ spec:
             summary: "shop: {{`{{ $value }}`}} под(ов) критического пути не могут запуститься"
             runbook: "kubectl describe pod — причина в Events (Insufficient cpu/memory, taint ноды, PVC на другой ноде). Хватает ли приоритета для preemption?"
 
-        # 3. На нодах было давление по памяти — kubelet выселял поды.
-        - alert: ShopPodsEvicted
-          expr: sum(kube_pod_status_reason{namespace="{{ .Release.Namespace }}", reason="Evicted"}) > 0
+        # 3. Давление по памяти на ноде — kubelet уже выселяет (или вот-вот начнёт) поды.
+        # Не по kube_pod_status_reason="Evicted": в k8s 1.37 выселенный под, завершившийся по SIGTERM
+        # с кодом 0, остаётся Succeeded без reason — такой алерт молчал бы. Ловим причину, а не следствие.
+        - alert: ShopNodeMemoryPressure
+          expr: max by (node) (kube_node_status_condition{condition="MemoryPressure", status="true"}) == 1
           labels: {severity: warning}
           annotations:
-            summary: "shop: {{`{{ $value }}`}} под(ов) выселено kubelet (нехватка ресурсов на ноде)"
-            runbook: "kubectl get events | grep Evicted — кого и на какой ноде. Если это batch — ок, так задумано; если api/postgres — срочно смотреть память ноды."
+            summary: "нода {{`{{ $labels.node }}`}}: давление по памяти, kubelet выселяет поды"
+            runbook: "kubectl get events -A | grep Evicted — кого выселили. batch — ок, так задумано; api/postgres — срочно: кто съел память ноды (дашборд, панель «Память»)."
 ---
 apiVersion: v1
 kind: ConfigMap

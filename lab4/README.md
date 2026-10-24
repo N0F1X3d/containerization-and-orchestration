@@ -156,3 +156,71 @@ helm upgrade shop charts/shop -n shop -f values/part0-install.yaml -f values/par
 - **PDB** — только **добровольные** выселения: `kubectl drain`, eviction API. `shop-api` `minAvailable: 2` — из трёх реплик за раз можно увести не больше одной (`ALLOWED DISRUPTIONS 1`). `shop-postgres` `minAvailable: 1` при одном экземпляре — `0`: базу добровольно не трогаем вообще. От падения ноды PDB не спасает — от этого защищает разнесение (часть 4).
 
 Грабли: PDB для postgres я сначала назвал `shop-db` — и оператор CloudNativePG его тут же удалял, а Helm висел до таймаута (`PodDisruptionBudget/shop/shop-db not ready`). Оператор называет свой PDB по имени кластера и, раз мы выключили его PDB (`enablePDB: false`), удаляет любой объект с этим именем. Переименовал в `shop-postgres`.
+
+## Части 6–9 — один эксперимент под нагрузкой
+
+Всё время частей 6–7 k6 держал обычную нагрузку — 20 заказов/с, 30 минут. В это время я создавал нехватку (часть 6) и давление по памяти (часть 7), а потом смотрел по графикам, удержался ли SLA (часть 8) и что поймали алерты (часть 9).
+
+## Часть 6 — нехватка, Pending и preemption
+
+### Pending
+
+Поднял `batch` до 12 реплик — [`values/part6-scarcity.yaml`](values/part6-scarcity.yaml). По расчёту свободного CPU (по requests) хватало примерно на 9 подов по 250m:
+
+![Pending](screenshots/09_part6_pending.png)
+
+9 `Running`, 3 `Pending`: `0/2 nodes are available: 2 Insufficient cpu. preemption: not eligible due to preemptionPolicy=Never`. Сами `batch` никого не вытесняют — `preemptionPolicy: Never`, не влез — ждёт.
+
+![requests](screenshots/10_part6_requests_vs_usage.png)
+
+Заказано CPU 89% и 97% нод — а реально `batch` жжёт около трети ядра (`cpuDuty: 30`), на нодах полно свободного процессора. **Планировщик считает по requests, а не по факту**: requests — это обещание «столько тебе гарантировано», и он не ставит под, если не может это обещание выполнить. Реальная загрузка на это не влияет.
+
+![batch available vs desired](screenshots/10b_part6_usage_grafana.png)
+
+### Preemption
+
+Пик: критическому `api` понадобилось резко вырасти до 24 реплик — [`values/part6-preempt.yaml`](values/part6-preempt.yaml). У `api` request всего 10m, поэтому реплик нужно много, чтобы им перестало хватать щелей.
+
+![preemption](screenshots/11_part6_preemption.png)
+
+`Preempted by pod ... on node lab-control-plane`: новому `api` (приоритет 100000) не хватило места — планировщик выбрал на ноде под с самым низким приоритетом (`batch`, −100), удалил его и поставил `api` на освободившееся место.
+
+![после preemption](screenshots/12_part6_after_preemption.png)
+
+Все 24 `api` `Running`, `batch` было 9 из 12 — стало 8. Вытесненный `batch` не исчез: ReplicaSet пересоздал его, и он встал в очередь `Pending` к остальным.
+
+### Побочный эффект: упал Kyverno
+
+Пока на нодах жили 24 `api` и 8 `batch`, Kyverno перестал отвечать (`failed calling webhook "validate.kyverno.svc-fail" ... connection refused`), и следующий `helm upgrade` не прошёл. Причина — отказ от CPU-лимитов в части 5: при конкуренции за CPU ядро делит его по requests, а у каждого `batch` вес 250m против 100m у admission-контроллера Kyverno. Kyverno не успевал отвечать на liveness-пробу, kubelet его перезапустил, а пока он поднимался, вебхук с `failurePolicy: Fail` блокировал любые изменения (как в лабе 3, часть 4). Вывод: без CPU-лимитов от «шумного соседа» защищают только **реалистичные requests у всех**, включая инфраструктуру. Через минуту Kyverno поднялся, и всё прошло.
+
+## Часть 7 — давление по памяти
+
+В kind порог выселения по памяти **не задан вообще** — в конфиге kubelet были только пороги по диску. Задал на `lab-worker` `evictionHard: memory.available: 4Gi` (из-за `systemReserved` это примерно «поды на ноде съели больше ~1.7 ГБ») и `evictionPressureTransitionPeriod: 30s` (по умолчанию нода 5 минут остаётся в состоянии давления после того, как оно спало).
+
+[`values/part7-memory.yaml`](values/part7-memory.yaml): `api` вернул к 3 репликам, `batch` прибил к `lab-worker` (там порог) и поднял его память — 4 пода по 500 МБ, это выше их requests (128Mi).
+
+![eviction](screenshots/13_part7_eviction.png)
+
+Через 40 секунд `MemoryPressure=True`, и kubelet выселил `batch`: `The node was low on resource: memory. Threshold quantity: 4Gi, available: 4186256Ki. Container batch was using 323232Ki, request is 128Mi, has larger consumption of memory.` — kubelet прямо пишет, почему именно этот под: потребляет больше своего request.
+
+`api` и `shop-db-1` на той же ноде остались `Running`, рестартов 0. Выселен только `batch` — по событиям в namespace больше никого. (`Completed` у кучи подов `api` — это не выселение, а 21 лишняя реплика после возврата с 24 до 3.)
+
+Ещё видно `OOMKilled` у нескольких `batch` — это я промахнулся с числом: 500 МБ `batch` набирает кусками по 16 МиБ, выходит 512 МиБ плюс рантайм Go — больше собственного лимита 512Mi. Получилось наглядно: на одном экране оба диагноза.
+
+### Evicted против OOMKilled
+
+Для чистоты — один `batch` с 700 МБ при лимите 512Mi ([`values/part7-oomkill.yaml`](values/part7-oomkill.yaml)), давления на ноду нет:
+
+![OOMKilled](screenshots/14_part7_oomkilled.png)
+
+`last=OOMKilled`, `restarts=1` — и под тот же, на той же ноде.
+
+| | Evicted | OOMKilled |
+|---|---|---|
+| кто убивает | **kubelet** | **ядро** (OOM killer в memory cgroup) |
+| из-за чего | на **ноде** кончается память (ниже порога `evictionHard`) | **контейнер** упёрся в свой `limits.memory` |
+| кого выбирают | по порядку: превысил ли requests → приоритет → насколько превысил | только тот контейнер, что упёрся в лимит |
+| что с подом | под **удалён** с ноды, контроллер создаёт **новый** (может встать на другую ноду) | под **остаётся**, контейнер перезапускается на месте (`RESTARTS`++, при повторах — CrashLoopBackOff) |
+| что чинить | ёмкость ноды / requests соседей / кто съел память ноды | лимит контейнера мал или в нём утечка |
+
+Симптом одинаковый — «под умер, памяти не хватило», а диагнозы разные: в первом случае виновата нода и соседи, во втором — сам контейнер.
