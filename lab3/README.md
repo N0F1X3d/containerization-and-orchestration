@@ -204,3 +204,47 @@ helm upgrade shop charts/shop -n shop --reuse-values --set postgres.enabled=true
 
 - **Почему данные пережили удаление пода.** Данные лежат в PVC `shop-db-1`, а не в поде. Под удалили — PVC остался, оператор создал новый под **с тем же именем** и подключил к нему тот же диск. Заказ `book` на месте.
 - **Что будет при `instances: 3`.** Оператор поднимет `shop-db-2` и `shop-db-3` как реплики с потоковой репликацией от primary. Для этого и три сервиса: `-rw` всегда указывает на primary (запись), `-ro` — на реплики (чтение), `-r` — на любой экземпляр. Упадёт primary — оператор сам повысит реплику и перенаправит `-rw` на неё (failover).
+
+## Часть 4 — падение control plane
+
+apiserver в kind — static pod: kubelet запускает его из файла `/etc/kubernetes/manifests/kube-apiserver.yaml` на ноде. Убрал файл — kubelet остановил apiserver:
+
+```bash
+docker exec lab-control-plane mv /etc/kubernetes/manifests/kube-apiserver.yaml /root/
+```
+
+Адрес сервиса запомнил заранее, а запросы слал изнутри ноды (`docker exec lab-control-plane curl ...`) — `kubectl port-forward` сам работает через apiserver и умер бы вместе с ним.
+
+### Изменения не проходят
+
+![изменения не проходят](screenshots/14_part4_changes_failed.png)
+
+`kubectl get pods` и `helm upgrade` — `connection reset` / `cluster unreachable`. Управлять кластером нечем.
+
+### А shop работает
+
+![shop живой](screenshots/15_part4_shop_alive.png)
+
+- `/health` → `ok`;
+- новый заказ `during-outage` создался в postgres и через 0.8 с **обработан worker'ом**;
+- на ноде работают контейнеры `postgres`, `api` ×3, `worker` ×2 — а `kube-apiserver` среди них нет.
+
+### Возвращаю control plane
+
+```bash
+docker exec lab-control-plane mv /root/kube-apiserver.yaml /etc/kubernetes/manifests/
+```
+
+![восстановление](screenshots/16_part4_restored.png)
+
+apiserver поднялся за секунды, поды на месте. Но первый `helm upgrade` **упал**: `failed calling webhook "validate.kyverno.svc-fail" ... connection refused` и то же про вебхук CNPG.
+
+Причина: пока apiserver лежал, контроллеры Kyverno и CNPG не могли продлить свою аренду лидера (leader election) и сами завершились — так задумано, чтобы не работало два «лидера» сразу. После возврата apiserver они ещё пару минут перезапускались. А их admission-вебхуки настроены с `failurePolicy: Fail` — «вебхук не отвечает → запретить». Поэтому всё, что они охраняют (Deployment'ы — Kyverno, `Cluster` — CNPG), временно нельзя было менять. Через ~2–3 минуты оба поднялись, и тот же `helm upgrade` прошёл:
+
+![вебхуки восстановились](screenshots/17_part4_webhooks_recovered.png)
+
+### Что понял
+
+- **Почему shop работал без apiserver.** Запущенные контейнеры держит **kubelet** на ноде — ему не нужно спрашивать apiserver, чтобы контейнер продолжал работать. Трафик `ClusterIP → под` ведёт **kube-proxy**, а его правила уже записаны в ядро ноды (iptables) и работают сами — пока ничего не меняется, их незачем обновлять. Control plane нужен для **изменений**, а не для работы уже запущенного.
+- **Что восстанавливается без control plane.** Упал процесс в контейнере → kubelet перезапустит его сам, это локальное решение по `restartPolicy`. Удалили под целиком → не вернётся: новый под создаёт контроллер ReplicaSet (в controller-manager), а ставит на ноду scheduler — обоим нужен apiserver. Без control plane самовосстановление — только «перезапустить контейнер на той же ноде».
+- **Почему у Kyverno `failurePolicy: Fail`, а не `Ignore`.** С `Ignore` любое падение Kyverno стало бы окном, в которое проходит что угодно — privileged-под, чужой образ. Политики можно было бы обойти, просто дождавшись (или устроив) падения Kyverno. Политика безопасности должна быть fail-closed: лучше пару минут ничего нельзя менять, чем пропустить нарушение.
