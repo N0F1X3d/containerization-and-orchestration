@@ -1,0 +1,5 @@
+# Часть 4: разносим реплики api по нодам выбранным механизмом.
+placement:
+  mode: topologySpread
+  hard: true      # DoNotSchedule: лучше Pending, чем две реплики на одной ноде сверх maxSkew
+  maxSkew: 1

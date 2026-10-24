@@ -1,0 +1,30 @@
+# Запрет privileged-контейнеров: такой контейнер — фактически root на ноде.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged
+  annotations:
+    policies.kyverno.io/description: privileged отключает почти всю изоляцию (все capabilities, доступ к устройствам ноды).
+spec:
+  background: true
+  rules:
+    - name: privileged-false
+      match:
+        any:
+          - resources: {kinds: [Pod]}
+      # Системные namespace и уже работающая инфраструктура (стек из лабы 2, сам Kyverno, оператор БД) — не трогаем.
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kube-public, kube-node-lease, local-path-storage, kyverno, cnpg-system, monitoring, lab2]
+      validate:
+        failureAction: Enforce
+        message: "privileged-контейнеры запрещены."
+        pattern:
+          spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"

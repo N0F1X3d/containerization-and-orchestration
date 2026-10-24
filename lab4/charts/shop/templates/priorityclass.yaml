@@ -1,0 +1,20 @@
+{{- if .Values.priorityClasses.enabled }}
+# Часть 5. PriorityClass — объект на весь кластер (не в namespace).
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.priorityClasses.critical.name }}
+  labels: {{- include "shop.labels" . | nindent 4 }}
+value: {{ .Values.priorityClasses.critical.value }}
+description: "Критический путь заказа (api, postgres): может вытеснять менее важные поды."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.priorityClasses.low.name }}
+  labels: {{- include "shop.labels" . | nindent 4 }}
+value: {{ .Values.priorityClasses.low.value }}
+# batch сам никого не вытесняет — не влез, значит ждёт.
+preemptionPolicy: Never
+description: "Фоновая нагрузка (batch): жертвуем первой."
+{{- end }}

@@ -1,0 +1,43 @@
+# Стек из лабы 2 (тот же values), пересозданный на 2-нодовом кластере лабы 4. Loki/Jaeger здесь не нужны.
+# kube-prometheus-stack: Prometheus Operator + Prometheus + Alertmanager + Grafana (+ node-exporter, kube-state-metrics).
+fullnameOverride: kps
+
+# Компоненты control plane в kind не скрейпятся снаружи — выключаем, чтобы не было ложных алертов/ошибок.
+kubeEtcd: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeProxy: {enabled: false}
+# Встроенные правила (их ~150) тоже выключаем — в Alertmanager/Karma будут только наши три алерта.
+defaultRules: {create: false}
+
+prometheus:
+  prometheusSpec:
+    # По умолчанию Prometheus берёт только ServiceMonitor/PrometheusRule с лейблами своего релиза.
+    # false = брать все из всех namespace — тогда подхватятся ресурсы из чарта api.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    retention: 2d
+
+# Получателя из лабы 2 здесь нет — алерты смотрим в Alertmanager/Karma, рассылка не нужна.
+alertmanager:
+  config:
+    route:
+      receiver: "null"
+      group_by: [alertname]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+      routes: []
+    receivers:
+      - name: "null"
+
+grafana:
+  adminPassword: admin
+  grafana.ini:
+    auth.anonymous: {enabled: true, org_role: Admin}
+  sidecar:
+    dashboards:
+      searchNamespace: ALL   # подхватывать дашборды (ConfigMap с grafana_dashboard=1) из всех namespace

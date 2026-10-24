@@ -1,0 +1,16 @@
+# Кластер лабы 4: строго 2 ноды и искусственно мало ресурсов под поды.
+# Обе ноды kind живут в одной VM (4 CPU, 8 ГБ) и по умолчанию каждая думает, что ей принадлежит всё.
+# systemReserved «отрезает» у каждой ноды 2 CPU и 2 ГБ: allocatable становится 2 CPU / ~5.7 ГБ,
+# и планировщик быстро упрётся в нехватку requests.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lab
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    systemReserved:
+      cpu: "2"
+      memory: "2Gi"
+nodes:
+  - role: control-plane
+  - role: worker

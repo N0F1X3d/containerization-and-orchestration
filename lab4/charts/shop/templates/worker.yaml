@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-worker
+  labels:
+    app.kubernetes.io/name: shop-worker
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: shop-worker}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: shop-worker
+        {{- include "shop.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.worker.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            {{- include "shop.dbEnv" . | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.worker.resources | nindent 12 }}
+          {{- include "shop.containerSecurity" . | nindent 10 }}
+          {{- include "shop.dbMount" . | nindent 10 }}
+      {{- include "shop.dbVolume" . | nindent 6 }}
+---
+# Service для worker нужен только ServiceMonitor'у (метрики на :8080).
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop-worker
+  labels:
+    app.kubernetes.io/name: shop-worker
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  selector: {app.kubernetes.io/name: shop-worker}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

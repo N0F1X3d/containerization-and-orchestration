@@ -1,0 +1,34 @@
+{{- if .Values.postgres.enabled }}
+# Объект оператора CloudNativePG: мы описываем ЖЕЛАЕМОЕ (spec), оператор сам создаёт поды,
+# PVC, сервисы shop-db-rw/ro/r, Secret shop-db-app с паролем и следит, чтобы всё так и было.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: shop-db
+  labels:
+    app.kubernetes.io/name: shop-db
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.postgres.instances }}
+  imageName: {{ .Values.postgres.image }}
+  storage:
+    size: {{ .Values.postgres.storage }}
+  resources: {{- toYaml .Values.postgres.resources | nindent 4 }}
+  # При остановке пода postgres делает «smart shutdown» — ждёт, пока клиенты сами отключатся (по умолчанию до 180 с).
+  # В бою это бережёт транзакции; для лабы сокращаем, чтобы под пересоздавался за секунды, а не за 3 минуты.
+  smartShutdownTimeout: 10
+  {{- with .Values.postgres.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
+  # PDB делаем своим шаблоном (pdb.yaml), встроенный у оператора выключаем.
+  enablePDB: false
+  bootstrap:
+    initdb:
+      database: shop
+      owner: shop
+  # Метки, которые оператор проставит на свои поды — иначе их не пропустит require-labels.
+  inheritedMetadata:
+    labels:
+      app.kubernetes.io/name: shop-db
+      app.kubernetes.io/part-of: shop
+{{- end }}

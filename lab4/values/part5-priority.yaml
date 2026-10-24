@@ -1,0 +1,41 @@
+# Часть 5: приоритеты, ресурсы и PDB.
+#
+# CPU-лимиты НЕ ставим нигде (совет преподавателя; krr тоже рекомендует CPU limit: unset).
+# CPU-лимит = жёсткий потолок с троттлингом даже на свободной ноде: если взять его «по krr»,
+# на пике под душится и SLA ломается. Без лимита CPU request работает как ВЕС (cgroup cpu.weight):
+# при конкуренции за CPU ядро делит его пропорционально requests — это и есть гарантия критического пути.
+# Поэтому CPU request критического пути снят под нагрузкой выше обещанной: 100 заказов/с (в 5 раз больше
+# SLA-нагрузки 20/с) — p95 CPU api 9m на под, postgres 18m.
+#
+# Следствие: QoS у api/postgres — Burstable, а не Guaranteed (Guaranteed требует limits = requests и по CPU).
+# Память у них requests = limits — за свой резерв они не выходят.
+
+priorityClasses:
+  enabled: true
+
+api:
+  priorityClassName: shop-critical
+  resources:
+    requests: {cpu: 10m, memory: 100Mi}
+    limits: {cpu: null, memory: 100Mi}
+  pdb:
+    enabled: true
+    minAvailable: 2
+
+postgres:
+  priorityClassName: shop-critical
+  resources:
+    requests: {cpu: 20m, memory: 256Mi}
+    limits: {cpu: null, memory: 256Mi}
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+# batch: низкий приоритет, requests заметно ниже limits. Лимит памяти есть (гвардрейлы лабы 3),
+# CPU-лимита — нет, как и у всех: свободный CPU пусть жжёт, при конкуренции его вес (250m) проиграет
+# весу критического пути — а при нехватке места его вытеснят (preemption) и выселят (eviction) первым.
+batch:
+  priorityClassName: shop-batch-low
+  resources:
+    requests: {cpu: 250m, memory: 128Mi}
+    limits: {cpu: null, memory: 512Mi}

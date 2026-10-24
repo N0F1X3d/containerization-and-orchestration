@@ -1,0 +1,27 @@
+# Часть 5. PodDisruptionBudget — защита от ДОБРОВОЛЬНЫХ вытеснений (drain ноды, eviction API):
+# не дать увести больше подов, чем можно, не потеряв сервис.
+{{- if .Values.api.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shop-api
+  labels: {{- include "shop.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.api.pdb.minAvailable }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: shop-api}
+{{- end }}
+{{- if and .Values.postgres.enabled .Values.postgres.pdb.enabled }}
+---
+# Не «shop-db»: это имя занято оператором CloudNativePG — свой PDB он называет по имени кластера
+# и, раз мы выключили его PDB (enablePDB: false), удаляет любой объект с этим именем.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shop-postgres
+  labels: {{- include "shop.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.postgres.pdb.minAvailable }}
+  selector:
+    matchLabels: {cnpg.io/cluster: shop-db}
+{{- end }}
