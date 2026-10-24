@@ -1,0 +1,37 @@
+{{- if .Values.batch.enabled }}
+# Часть 2. «Ночная аналитика» — фоновая нагрузка, которой под давлением жертвуем.
+# Гвардрейлы лабы 3 действуют и на неё: метки, requests/limits, доверенный образ, не privileged.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-batch
+  labels:
+    app.kubernetes.io/name: shop-batch
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.batch.replicas }}
+  selector:
+    matchLabels: {app.kubernetes.io/name: shop-batch}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: shop-batch
+        {{- include "shop.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.batch.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: 5
+      {{- with .Values.batch.node }}
+      nodeSelector: {kubernetes.io/hostname: {{ . }}}
+      {{- end }}
+      containers:
+        - name: batch
+          image: "{{ .Values.batch.image.repository }}:{{ .Values.batch.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: BATCH_MEMORY_MB, value: {{ .Values.batch.memoryMB | quote }}}
+            - {name: BATCH_CPU_WORKERS, value: {{ .Values.batch.cpuWorkers | quote }}}
+          resources: {{- toYaml .Values.batch.resources | nindent 12 }}
+          {{- include "shop.containerSecurity" . | nindent 10 }}
+{{- end }}

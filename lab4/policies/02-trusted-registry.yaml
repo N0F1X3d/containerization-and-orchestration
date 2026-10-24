@@ -1,0 +1,28 @@
+# Образы — только из доверенных реестров: наш registry.lab.local и образы самого CloudNativePG.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: trusted-registry
+  annotations:
+    policies.kyverno.io/description: Неизвестный образ из интернета может содержать что угодно.
+spec:
+  background: true
+  rules:
+    - name: images-from-trusted-registries
+      match:
+        any:
+          - resources: {kinds: [Pod]}
+      # Системные namespace и уже работающая инфраструктура (стек из лабы 2, сам Kyverno, оператор БД) — не трогаем.
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kube-public, kube-node-lease, local-path-storage, kyverno, cnpg-system, monitoring, lab2]
+      validate:
+        failureAction: Enforce
+        message: "Образы разрешены только из registry.lab.local/ и ghcr.io/cloudnative-pg/."
+        pattern:
+          spec:
+            =(initContainers):
+              - image: "registry.lab.local/* | ghcr.io/cloudnative-pg/*"
+            containers:
+              - image: "registry.lab.local/* | ghcr.io/cloudnative-pg/*"

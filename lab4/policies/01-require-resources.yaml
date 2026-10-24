@@ -1,0 +1,28 @@
+# Каждый контейнер обязан заявить requests (для планировщика) и limits (потолок для cgroup).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resources
+  annotations:
+    policies.kyverno.io/description: Контейнер без requests/limits может съесть всю ноду и ломает планирование.
+spec:
+  background: true
+  rules:
+    - name: containers-must-have-requests-and-limits
+      match:
+        any:
+          - resources: {kinds: [Pod]}
+      # Системные namespace и уже работающая инфраструктура (стек из лабы 2, сам Kyverno, оператор БД) — не трогаем.
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kube-public, kube-node-lease, local-path-storage, kyverno, cnpg-system, monitoring, lab2]
+      validate:
+        failureAction: Enforce
+        message: "Каждому контейнеру нужны resources.requests.cpu/memory и resources.limits.memory."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests: {cpu: "?*", memory: "?*"}
+                  limits: {memory: "?*"}

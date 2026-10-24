@@ -1,0 +1,4 @@
+# Karma — дашборд активных алертов поверх Alertmanager.
+env:
+  - name: ALERTMANAGER_URI
+    value: http://kps-alertmanager.monitoring:9093

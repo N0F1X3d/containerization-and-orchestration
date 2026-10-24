@@ -1,0 +1,77 @@
+# Часть 1: как разносить реплики api по нодам.
+#   none                — как получится (планировщик может сложить все реплики на одну ноду);
+#   antiAffinity        — podAntiAffinity: «не ставь две реплики api на одну ноду»;
+#   topologySpread      — topologySpreadConstraints: «держи разницу в числе реплик между нодами не больше maxSkew».
+placement:
+  mode: none
+  # Для antiAffinity: required — жёстко (не влезло — Pending), preferred — по возможности.
+  # Для topologySpread: DoNotSchedule — жёстко, ScheduleAnyway — по возможности.
+  hard: true
+  maxSkew: 1
+
+# Часть 5: классы приоритета. Чем больше value — тем важнее под: при нехватке места
+# планировщик может вытеснить (preempt) поды с меньшим приоритетом.
+priorityClasses:
+  enabled: false
+  critical: {name: shop-critical, value: 100000}
+  # Ниже нуля — ниже всех обычных подов кластера (у них приоритет 0): batch жертвуем первым.
+  low: {name: shop-batch-low, value: -100}
+
+api:
+  replicas: 3
+  image:
+    repository: registry.lab.local/shop/api
+    tag: "1.2"          # 1.2 = 1.1 + гистограмма времени ответа (для SLA)
+  healthFail: false
+  nodePort: 30080       # снаружи кластера: http://<IP любой ноды>:30080
+  priorityClassName: ""
+  # Часть 3: изначальная догадка; после krr сюда пишутся рекомендованные числа.
+  resources:
+    requests: {cpu: 20m, memory: 32Mi}
+    limits: {cpu: 200m, memory: 64Mi}
+  pdb:
+    enabled: false
+    minAvailable: 2     # из 3 реплик при добровольных вытеснениях (drain) живыми остаются минимум 2
+
+worker:
+  replicas: 2
+  image:
+    repository: registry.lab.local/shop/worker
+    tag: "1.0"
+  priorityClassName: ""
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 100m, memory: 64Mi}
+
+postgres:
+  enabled: true
+  instances: 1
+  image: ghcr.io/cloudnative-pg/postgresql:18.1
+  storage: 1Gi
+  priorityClassName: ""
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+  pdb:
+    enabled: false
+    minAvailable: 1
+
+# Часть 2: «ночная аналитика» — жрёт CPU и память, жертвуем ей первой.
+batch:
+  enabled: false
+  replicas: 1
+  image:
+    repository: registry.lab.local/shop/batch
+    tag: "1.0"
+  memoryMB: 64          # сколько памяти держит каждый под
+  node: ""              # часть 7: прибить batch к одной ноде, чтобы давление по памяти было именно там
+  cpuWorkers: 1         # сколько циклов крутят CPU
+  priorityClassName: ""
+  resources:
+    requests: {cpu: 250m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+
+monitoring:
+  enabled: false
+  backlogThreshold: 20
+  slaSeconds: 0.3       # SLA: 95% заказов быстрее 300 мс

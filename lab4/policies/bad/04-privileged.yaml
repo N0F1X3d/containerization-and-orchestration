@@ -1,0 +1,15 @@
+# Нарушает disallow-privileged.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-privileged
+  namespace: shop
+  labels: {app.kubernetes.io/name: bad, app.kubernetes.io/part-of: shop}
+spec:
+  containers:
+    - name: app
+      image: registry.lab.local/shop/api:1.0
+      securityContext: {privileged: true}
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {memory: 32Mi}

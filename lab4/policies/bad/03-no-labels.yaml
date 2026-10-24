@@ -1,0 +1,13 @@
+# Нарушает require-labels: нет меток.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-no-labels
+  namespace: shop
+spec:
+  containers:
+    - name: app
+      image: registry.lab.local/shop/api:1.0
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {memory: 32Mi}

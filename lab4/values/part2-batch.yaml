@@ -1,0 +1,4 @@
+# Часть 2: включаем batch — «ночную аналитику». Requests/limits — как у любого пода (гвардрейлы лабы 3).
+batch:
+  enabled: true
+  replicas: 1
