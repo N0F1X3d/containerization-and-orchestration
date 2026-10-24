@@ -32,6 +32,7 @@ spec:
           env:
             - {name: BATCH_MEMORY_MB, value: {{ .Values.batch.memoryMB | quote }}}
             - {name: BATCH_CPU_WORKERS, value: {{ .Values.batch.cpuWorkers | quote }}}
+            - {name: BATCH_CPU_DUTY, value: {{ .Values.batch.cpuDuty | quote }}}
           resources: {{- toYaml .Values.batch.resources | nindent 12 }}
           {{- include "shop.containerSecurity" . | nindent 10 }}
 {{- end }}

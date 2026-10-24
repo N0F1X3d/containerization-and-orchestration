@@ -98,9 +98,61 @@ krr simple -k ~/.kube/kind-lab.yaml -p http://localhost:9090 -n shop --history_d
 Применил через [`values/part3-krr.yaml`](values/part3-krr.yaml) (откуда каждое число — в комментариях; `null` убирает CPU limit, как советует krr):
 
 ```bash
-helm upgrade shop charts/shop -n shop --reuse-values -f values/part3-krr.yaml --wait
+helm upgrade shop charts/shop -n shop --reuse-values -f values/part3-krr.yaml --wait   # дальше — без --reuse-values, см. часть 4
 ```
 
 ![применено](screenshots/05_part3_applied.png)
 
-Пока у всех подов QoS `Burstable` — исправлю в части 5.
+Пока у всех подов QoS `Burstable` — к этому вернусь в части 5.
+
+## Часть 4 — разнесение api
+
+Включил механизм из части 1 — [`values/part4-spread.yaml`](values/part4-spread.yaml): `topologySpread`, `maxSkew: 1`, жёсткий режим (`DoNotSchedule`).
+
+Начиная с этой части применяю **все надстройки по порядку**, без `--reuse-values`:
+
+```bash
+helm upgrade shop charts/shop -n shop -f values/part0-install.yaml -f values/part2-batch.yaml \
+  -f values/part3-krr.yaml -f values/part4-spread.yaml --wait
+```
+
+Грабли: с `--reuse-values` апгрейд упал (`requests: Invalid value: "10m": must be less than or equal to cpu limit of 0`). `cpu: null` в надстройке части 3 убирает CPU limit только когда надстройка накладывается на дефолты чарта; `--reuse-values` же берёт значения прошлого релиза, и `null` уходит в манифест буквально. С полным списком `-f` всё честно: вся конфигурация видна в одной команде и воспроизводится с нуля.
+
+![разнесение](screenshots/06_part4_spread.png)
+
+Шаблон пода изменился → rolling update, и новые поды встали уже по правилу: 2 на `lab-control-plane`, 1 на `lab-worker`.
+
+**Как это повышает отказоустойчивость.** Падает любая нода (сбой, перезагрузка) — на другой остаётся хотя бы одна реплика `api`, Service сразу перестаёт слать трафик на потерянные, и сервис продолжает отвечать, пока Deployment не пересоздаст недостающие поды. Без разнесения все три реплики могли оказаться на одной ноде (в части 2 так и было: 2 из 3 на `lab-worker`), и её потеря остановила бы `api` целиком. Предел: на двух нодах потеря «двойной» ноды оставляет одну реплику из трёх — доступность есть, ёмкости меньше. Полнее защищают только больше нод или реплик.
+
+## Часть 5 — приоритеты и гарантии
+
+[`values/part5-priority.yaml`](values/part5-priority.yaml) + шаблоны [`priorityclass.yaml`](charts/shop/templates/priorityclass.yaml) и [`pdb.yaml`](charts/shop/templates/pdb.yaml).
+
+![приоритеты и QoS](screenshots/07_part5_priority_qos.png)
+
+![PriorityClass и PDB](screenshots/08_part5_pdb.png)
+
+| | PriorityClass | CPU request / limit | Память request / limit | QoS | PDB |
+|---|---|---|---|---|---|
+| api | `shop-critical` (100000) | 10m / **нет** | 100Mi / 100Mi | Burstable | `minAvailable: 2` |
+| postgres | `shop-critical` (100000) | 20m / **нет** | 256Mi / 256Mi | Burstable | `minAvailable: 1` |
+| worker | обычный (0) | 10m / нет | 100Mi / 100Mi | Burstable | — |
+| batch | `shop-batch-low` (−100, `preemptionPolicy: Never`) | 250m / нет | 128Mi / 512Mi | Burstable | — |
+
+### Почему не Guaranteed: без CPU-лимитов
+
+Задание просит для api/postgres QoS Guaranteed — а его Kubernetes даёт, только если `limits = requests` у каждого контейнера и по памяти, **и по CPU**. CPU-лимиты я сознательно не ставлю (совет преподавателя; krr тоже рекомендует `CPU limit: unset`):
+
+- CPU-лимит — жёсткий потолок: под троттлится даже на свободной ноде (CFS-квота, лаба 1 часть 3). Взять лимит «по krr» = душить под на первом же пике. У другого студента на этой же лабе ровно так и вышло: postgres с CPU limit = рекомендация krr уходил в 100% троттлинг, и p95 заказа взлетал до секунд;
+- без лимита CPU request работает как **вес** (`cpu.weight` в cgroup v2): свободный CPU может брать кто угодно, а при конкуренции ядро делит CPU пропорционально requests. Это и есть гарантия критического пути. Поэтому CPU request api/postgres снят под нагрузкой **выше обещанной**: 100 заказов/с (в 5 раз больше SLA-нагрузки) — p95 CPU api 9m на под → 10m, postgres 18m → 20m;
+- лимиты памяти есть у всех — гвардрейлы лабы 3 требуют именно их, CPU-лимит Kyverno не требует.
+
+Цена: QoS у api/postgres — Burstable. Под давлением по памяти это почти ничего не меняет (см. ниже), а то, что Guaranteed дал бы сверх этого, — минимальный `oom_score_adj` (−997) при **ядерном** OOM ноды.
+
+### Что даёт каждая настройка под давлением
+
+- **PriorityClass** — при **нехватке места при планировании**. Не влез под с высоким приоритетом — планировщик вытесняет (preempt) поды с более низким, чтобы освободить место. `shop-critical` может вытеснять `batch`; `batch` с `preemptionPolicy: Never` сам не вытесняет никого — не влез, значит ждёт в Pending. Приоритет −100 ниже всех обычных подов кластера (у них 0): `batch` жертвуем первым.
+- **QoS / requests** — при **нехватке ресурсов на ноде**. Давление по памяти → kubelet выбирает, кого выселить (eviction), по порядку: сначала поды, у которых потребление **выше их memory requests**, среди них — с **меньшим приоритетом**, дальше — у кого превышение больше. `batch` держит память сильно выше своих 128Mi и с приоритетом −100 → первый. `api` (11 МиБ при request 100Mi) и postgres (85 МиБ при 256Mi) свой резерв не превышают → в самом конце очереди. Классы на этом и построены: BestEffort (requests нет вообще) всегда «превышает» — уходит первым; Burstable — если вылез за requests; Guaranteed по определению за requests не вылезает — уходит последним. Поэтому для порядка выселения важно не название класса, а «держится ли под в своих requests» — api держится и без Guaranteed.
+- **PDB** — только **добровольные** выселения: `kubectl drain`, eviction API. `shop-api` `minAvailable: 2` — из трёх реплик за раз можно увести не больше одной (`ALLOWED DISRUPTIONS 1`). `shop-postgres` `minAvailable: 1` при одном экземпляре — `0`: базу добровольно не трогаем вообще. От падения ноды PDB не спасает — от этого защищает разнесение (часть 4).
+
+Грабли: PDB для postgres я сначала назвал `shop-db` — и оператор CloudNativePG его тут же удалял, а Helm висел до таймаута (`PodDisruptionBudget/shop/shop-db not ready`). Оператор называет свой PDB по имени кластера и, раз мы выключили его PDB (`enablePDB: false`), удаляет любой объект с этим именем. Переименовал в `shop-postgres`.
