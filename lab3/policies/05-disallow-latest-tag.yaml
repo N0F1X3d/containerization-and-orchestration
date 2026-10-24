@@ -1,0 +1,26 @@
+# Свой: запрет тега :latest (и образа без тега, что то же самое).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/description: ":latest меняется без предупреждения — непонятно, что реально запущено, и нельзя откатиться."
+spec:
+  background: true
+  rules:
+    - name: explicit-non-latest-tag
+      match:
+        any:
+          - resources: {kinds: [Pod]}
+      # Системные namespace и уже работающая инфраструктура (стек из лабы 2, сам Kyverno, оператор БД) — не трогаем.
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kube-public, kube-node-lease, local-path-storage, kyverno, cnpg-system, monitoring, lab2]
+      validate:
+        failureAction: Enforce
+        message: "Нужен явный тег образа, не :latest."
+        pattern:
+          spec:
+            containers:
+              - image: "*:* & !*:latest"

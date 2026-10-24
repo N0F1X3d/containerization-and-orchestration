@@ -1,0 +1,14 @@
+# Нарушает disallow-latest-tag.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-latest
+  namespace: shop
+  labels: {app.kubernetes.io/name: bad, app.kubernetes.io/part-of: shop}
+spec:
+  containers:
+    - name: app
+      image: registry.lab.local/shop/api:latest
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {memory: 32Mi}

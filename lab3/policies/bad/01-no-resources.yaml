@@ -1,0 +1,11 @@
+# Нарушает require-resources: нет requests/limits.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-no-resources
+  namespace: shop
+  labels: {app.kubernetes.io/name: bad, app.kubernetes.io/part-of: shop}
+spec:
+  containers:
+    - name: app
+      image: registry.lab.local/shop/api:1.0
