@@ -1,0 +1,78 @@
+{{- if .Values.monitoring.enabled }}
+# Prometheus из лабы 2 подхватывает эти ресурсы сам (selector'ы NilUsesHelmValues: false).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: shop
+  labels: {{- include "shop.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchExpressions:
+      - {key: app.kubernetes.io/name, operator: In, values: [shop-api, shop-worker]}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+# У postgres-подов нет нашего Service — метрики оператора (порт metrics, 9187) снимаем PodMonitor'ом.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: shop-db
+  labels: {{- include "shop.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {cnpg.io/cluster: shop-db}
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: shop
+  labels: {{- include "shop.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: shop
+      rules:
+        # 1. Заказы принимаются, но не обрабатываются — worker умер/завис/не успевает.
+        - alert: ShopOrdersBacklog
+          expr: max(shop_orders_pending{namespace="{{ .Release.Namespace }}"}) > {{ .Values.monitoring.backlogThreshold }}
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "shop: {{`{{ $value }}`}} заказов ждут обработки"
+            runbook: "kubectl get pods -l app.kubernetes.io/name=shop-worker; логи worker; есть ли ошибки БД (shop_worker_errors_total)."
+
+        # 2. Пользователи получают 5xx на заказах (не считая /health).
+        - alert: ShopApiErrors
+          expr: |
+            sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}", job="shop-api", path!="/health", code=~"5.."}[1m]))
+              / sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}", job="shop-api", path!="/health"}[1m])) > 0.05
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: "shop api: {{`{{ $value | humanizePercentage }}`}} запросов к заказам заканчиваются 5xx"
+            runbook: "Логи api (db error?) → состояние кластера БД: kubectl get cluster shop-db."
+
+        # 3. База недоступна — без неё не работает ничего.
+        - alert: ShopPostgresDown
+          expr: (max(cnpg_collector_up{namespace="{{ .Release.Namespace }}", cluster="shop-db"}) or vector(0)) == 0
+          for: 30s
+          labels: {severity: critical}
+          annotations:
+            summary: "shop: postgres shop-db не отвечает"
+            runbook: "kubectl get cluster shop-db (status), kubectl get pods -l cnpg.io/cluster=shop-db, логи оператора в cnpg-system."
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shop-dashboard
+  labels:
+    grafana_dashboard: "1"
+    {{- include "shop.labels" . | nindent 4 }}
+data:
+  shop.json: |-
+{{ .Files.Get "files/shop-dashboard.json" | indent 4 }}
+{{- end }}

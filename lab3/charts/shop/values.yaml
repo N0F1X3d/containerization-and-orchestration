@@ -1,0 +1,34 @@
+api:
+  replicas: 3
+  image:
+    repository: registry.lab.local/shop/api
+    tag: "1.0"
+  # true — «сломанная версия»: /health отвечает 503, поды не проходят readiness (часть 2).
+  healthFail: false
+  resources:
+    requests: {cpu: 20m, memory: 32Mi}
+    limits: {cpu: 200m, memory: 64Mi}
+
+worker:
+  replicas: 2
+  image:
+    repository: registry.lab.local/shop/worker
+    tag: "1.0"
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 100m, memory: 64Mi}
+
+# Часть 3: postgres через оператор CloudNativePG.
+postgres:
+  enabled: false
+  instances: 1
+  image: ghcr.io/cloudnative-pg/postgresql:18.1
+  storage: 1Gi
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+
+# Часть 5: ServiceMonitor/PodMonitor + правила алертов + дашборд — поверх стека из лабы 2.
+monitoring:
+  enabled: false
+  backlogThreshold: 20     # сколько необработанных заказов — уже беда

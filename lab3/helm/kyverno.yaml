@@ -1,0 +1,5 @@
+# Kyverno одной репликой на каждый контроллер — для локального кластера достаточно.
+admissionController: {replicas: 1}
+backgroundController: {replicas: 1}
+cleanupController: {replicas: 1}
+reportsController: {replicas: 1}

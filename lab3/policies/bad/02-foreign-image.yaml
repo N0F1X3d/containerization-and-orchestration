@@ -1,0 +1,14 @@
+# Нарушает trusted-registry: образ с Docker Hub.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-foreign-image
+  namespace: shop
+  labels: {app.kubernetes.io/name: bad, app.kubernetes.io/part-of: shop}
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/nginx:1.29
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {memory: 32Mi}

@@ -1,0 +1,27 @@
+# Обязательные метки: что это за компонент и к какой системе относится.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+  annotations:
+    policies.kyverno.io/description: Без меток не найти владельца, не выбрать поды в Service/ServiceMonitor/NetworkPolicy.
+spec:
+  background: true
+  rules:
+    - name: pods-must-have-name-and-part-of
+      match:
+        any:
+          - resources: {kinds: [Pod]}
+      # Системные namespace и уже работающая инфраструктура (стек из лабы 2, сам Kyverno, оператор БД) — не трогаем.
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kube-public, kube-node-lease, local-path-storage, kyverno, cnpg-system, monitoring, lab2]
+      validate:
+        failureAction: Enforce
+        message: "Нужны метки app.kubernetes.io/name и app.kubernetes.io/part-of."
+        pattern:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "?*"
+              app.kubernetes.io/part-of: "?*"
