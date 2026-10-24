@@ -52,3 +52,55 @@ helm upgrade shop charts/shop -n shop --reuse-values -f values/part2-batch.yaml 
 ![shop с batch](screenshots/02_part2_shop_with_batch.png)
 
 Без правил разнесения планировщик положил 2 из 3 подов `api` на `lab-worker`. Упадёт эта нода — пропадут сразу две трети `api`. Это «до» для части 4.
+
+## Часть 3 — реальные числа вместо угадывания
+
+Сначала нагрузка по пути заказа — k6, 5 минут по 20 заказов в секунду через NodePort ([`load/order.js`](load/order.js)):
+
+```bash
+k6 run -e BASE_URL=http://<IP ноды>:30080 -e RATE=20 -e DURATION=5m load/order.js
+```
+
+![k6 без перегрузки](screenshots/03_part3_k6_baseline.png)
+
+Это заодно базовая линия SLA **без** перегрузки: p95 оформления заказа 0.76 мс при пороге 300 мс, 6000 заказов, 0% ошибок.
+
+Потом [krr](https://github.com/robusta-dev/krr) против namespace `shop` (готовая сборка krr под macOS оказалась сломана — ошибка PyInstaller, — поставил из исходников; запускал на маке, к кластеру и Prometheus — через проброшенные порты):
+
+```bash
+krr simple -k ~/.kube/kind-lab.yaml -p http://localhost:9090 -n shop --history_duration 1 --points_required 10
+```
+
+![krr](screenshots/04_part3_krr.png)
+
+Полный отчёт — [`krr/report.yaml`](krr/report.yaml). Стратегия `simple`: CPU request = p95 потребления, CPU limit — не ставить; память request и limit = максимум + 15%.
+
+### Догадка против krr против реальности
+
+| | моя догадка (req / lim) | krr | реально (за 1 ч с нагрузкой) |
+|---|---|---|---|
+| api CPU | 20m / 200m | **10m** / нет лимита | p95 2m, max 2.5m |
+| api память | 32Mi / 64Mi | **100Mi** / 100Mi | max 11 МиБ |
+| worker CPU | 10m / 100m | 10m / нет лимита | p95 0.6m |
+| worker память | 32Mi / 64Mi | 100Mi / 100Mi | max 11 МиБ |
+| batch CPU | 250m / 500m | **513m** / нет лимита | упирается в limit 500m |
+| batch память | 128Mi / 256Mi | 100Mi / 100Mi | max 67 МиБ |
+| postgres CPU | 50m / 500m | krr не видит | p95 10m |
+| postgres память | 128Mi / 256Mi | krr не видит | max 82 МиБ |
+
+Почему расходится:
+
+- **Память api/worker — 100Mi при реальных 11 МиБ.** Это не измерение, а **минимальные значения krr** (`memory_min_value: 100` МБ, `cpu_min_value: 10m` в его конфиге). Реальное потребление ниже — krr подтягивает до своего пола. CPU по той же причине 10m.
+- **CPU и память считаются по-разному.** CPU — p95: упёрся в CPU — процесс просто притормаживают (throttling, лаба 1 часть 3). Память — максимум + 15%: упёрся в лимит памяти — OOMKill. Ошибка по памяти дороже, поэтому берут максимум с запасом.
+- **batch — 513m.** batch жрёт столько CPU, сколько дадут, и упирается в свой limit — krr честно говорит «ему нужно больше». Специально не поднимаю: batch — фоновая жертва, его requests держим низкими (часть 5).
+- **postgres krr не видит** — его поды принадлежат объекту `Cluster` оператора, а krr знает только Deployment/StatefulSet/DaemonSet/Job и т.п. Посчитал тем же методом напрямую из Prometheus: p95 CPU 10m, память max 82 МиБ → +15% → 95 МиБ → минимум 100Mi. **Но** `shared_buffers` у postgres = 128MB: по мере работы база заполнит буфер и упрётся в 100Mi — OOMKill. История в 1 час этого просто не видела, как не видела бы ночную аналитику или пиковый день месяца. Поэтому для postgres оставил 256Mi: krr — хорошая отправная точка, но не истина, её надо проверять пониманием того, как устроено приложение.
+
+Применил через [`values/part3-krr.yaml`](values/part3-krr.yaml) (откуда каждое число — в комментариях; `null` убирает CPU limit, как советует krr):
+
+```bash
+helm upgrade shop charts/shop -n shop --reuse-values -f values/part3-krr.yaml --wait
+```
+
+![применено](screenshots/05_part3_applied.png)
+
+Пока у всех подов QoS `Burstable` — исправлю в части 5.

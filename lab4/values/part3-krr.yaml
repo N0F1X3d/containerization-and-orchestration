@@ -1,0 +1,24 @@
+# Часть 3: requests/limits по рекомендациям krr (отчёт — krr/report.yaml).
+# krr simple: CPU request = p95 потребления, CPU limit = не ставить; память = max + 15% (и request, и limit).
+# Реальное потребление api/worker ниже минимальных значений krr (10m CPU / 100Mi) — он подтягивает до них.
+api:
+  resources:
+    requests: {cpu: 10m, memory: 100Mi}
+    limits: {cpu: null, memory: 100Mi}     # null — убрать CPU limit, как советует krr
+
+worker:
+  resources:
+    requests: {cpu: 10m, memory: 100Mi}
+    limits: {cpu: null, memory: 100Mi}
+
+# postgres krr не видит (его поды принадлежат объекту Cluster оператора). Тот же метод вручную, из Prometheus:
+# CPU p95 = 10m, память max = 82Mi → +15% = 95Mi → минимум krr 100Mi.
+# Но shared_buffers у postgres = 128MB: он будет расти дальше по мере заполнения кэша, лимит 100Mi = OOMKill.
+# История в 1 час этого не видит — оставляю память 256Mi.
+postgres:
+  resources:
+    requests: {cpu: 10m, memory: 256Mi}
+    limits: {cpu: null, memory: 256Mi}
+
+# batch krr предлагает 513m CPU — он жрёт столько, сколько дадут (упирается в limit 500m).
+# Не повышаю специально: batch — фоновая жертва, его requests держим низкими (часть 5: Burstable).
