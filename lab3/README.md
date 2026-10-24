@@ -248,3 +248,58 @@ apiserver поднялся за секунды, поды на месте. Но �
 - **Почему shop работал без apiserver.** Запущенные контейнеры держит **kubelet** на ноде — ему не нужно спрашивать apiserver, чтобы контейнер продолжал работать. Трафик `ClusterIP → под` ведёт **kube-proxy**, а его правила уже записаны в ядро ноды (iptables) и работают сами — пока ничего не меняется, их незачем обновлять. Control plane нужен для **изменений**, а не для работы уже запущенного.
 - **Что восстанавливается без control plane.** Упал процесс в контейнере → kubelet перезапустит его сам, это локальное решение по `restartPolicy`. Удалили под целиком → не вернётся: новый под создаёт контроллер ReplicaSet (в controller-manager), а ставит на ноду scheduler — обоим нужен apiserver. Без control plane самовосстановление — только «перезапустить контейнер на той же ноде».
 - **Почему у Kyverno `failurePolicy: Fail`, а не `Ignore`.** С `Ignore` любое падение Kyverno стало бы окном, в которое проходит что угодно — privileged-под, чужой образ. Политики можно было бы обойти, просто дождавшись (или устроив) падения Kyverno. Политика безопасности должна быть fail-closed: лучше пару минут ничего нельзя менять, чем пропустить нарушение.
+
+## Часть 5 — мониторинг
+
+Новый стек не поднимал — Prometheus из лабы 2 настроен подхватывать `ServiceMonitor`/`PodMonitor`/`PrometheusRule` из любого namespace. Достаточно положить их в чарт: [`monitoring.yaml`](charts/shop/templates/monitoring.yaml), включается `monitoring.enabled=true`.
+
+- **ServiceMonitor** — `/metrics` у `api` и `worker`;
+- **PodMonitor** — метрики postgres от CloudNativePG (порт `metrics`, 9187). У postgres-подов нет моего Service, поэтому снимаю по подам;
+- **PrometheusRule** — 3 алерта;
+- **дашборд** «Lab 3 — shop» (ConfigMap с `grafana_dashboard: "1"`, как в лабе 2) — [`files/shop-dashboard.json`](charts/shop/files/shop-dashboard.json).
+
+```bash
+helm upgrade shop charts/shop -n shop --reuse-values --set monitoring.enabled=true
+```
+
+![таргеты](screenshots/18_part5_targets.png)
+
+Скриншот снят сразу после включения: два пода api ещё ни разу не опрошены (`UNKNOWN`, `never`), через полминуты все 5 стали UP; `podMonitor/shop/shop-db/0` (postgres) — тоже UP.
+
+### Три алерта
+
+| Алерт | Условие | Что ловит | Почему важно | Что делать |
+|---|---|---|---|---|
+| `ShopOrdersBacklog` | `max(shop_orders_pending) > 20` дольше 1 мин | заказы принимаются, но не обрабатываются | самое коварное: api отвечает 201, всё «зелёное», а клиент свой заказ не получит. По HTTP-метрикам это не видно вообще | поды worker живы? логи worker, `shop_worker_errors_total` — нет ли ошибок БД |
+| `ShopApiErrors` | доля 5xx на `/order`, `/orders` > 5% дольше 1 мин (`/health` не считаю) | пользователи получают ошибки на заказах | прямая боль пользователя | логи api (`db error`?) → состояние базы `kubectl get cluster shop-db` |
+| `ShopPostgresDown` | `cnpg_collector_up == 0` (или метрики нет вовсе) дольше 30 с | база недоступна | без неё не работает ничего: ни приём, ни обработка заказов | `kubectl get cluster shop-db` (status), поды `cnpg.io/cluster=shop-db`, логи оператора в `cnpg-system` |
+
+`max()` в `ShopOrdersBacklog` — потому что очередь отдаёт каждый из трёх подов api (это запрос в одну и ту же базу), и без `max` было бы три одинаковых алерта. `or vector(0)` в `ShopPostgresDown` — чтобы алерт сработал и когда пода с метриками нет вообще (тот же урок, что `absent` в лабе 2).
+
+### Провоцирую `ShopOrdersBacklog`
+
+Погасил worker'ы (`scale --replicas=0`) и отправил 50 заказов:
+
+![дашборд](screenshots/19_part5_dashboards.png)
+
+«Создано» подскочило, «обработано» — ноль, очередь 50, у `shop-worker` desired/available упали в 0, postgres жив.
+
+![алерт firing](screenshots/20_part5_alert_firing.png)
+
+![Karma](screenshots/21_part5_karma.png)
+
+`ShopOrdersBacklog` горит в Prometheus (рядом — неактивные алерты лабы 2: всё в одном Prometheus) и в Karma с `summary` «50 заказов ждут обработки» и runbook. Вернул worker'ы — очередь разобралась за пару секунд, алерт погас.
+
+### Что понял
+
+- **Почему для postgres PodMonitor.** ServiceMonitor ищет таргеты через Service: выбирает сервисы по метке и берёт адреса подов за ними. У `api` и `worker` есть мои Service с портом `http`, где и `/metrics`. А у postgres сервисы оператора (`shop-db-rw/ro/r`) открывают только 5432 — порта метрик 9187 там нет. PodMonitor идёт к подам напрямую по метке `cnpg.io/cluster`.
+- **Чем `ShopOrdersBacklog` ценнее «много 5xx».** Когда worker лежал, api на `POST /order` честно отвечал `201`, ошибок 0 — по HTTP-метрикам всё зелёное. А пользователь получил «заказ принят» и так его и не дождался. Эту поломку видно только по очереди — поэтому алерт на бизнес-метрику, а не только на HTTP.
+- **Зачем `max()`.** Метрику `shop_orders_pending` отдаёт каждый из трёх подов api, и каждый считает её одним и тем же запросом к одной базе — три ряда с одинаковым значением. Без `max()` загорелось бы три одинаковых алерта.
+
+## Итог
+
+- ограждения политикой (Kyverno, 5 правил) стоят на кластере раньше чарта, нарушающие манифесты и неправильный чарт не проходят;
+- чарт `shop` (api, worker, postgres через CloudNativePG, мониторинг) ставится с нуля без единого отклонения;
+- удалённые руками поды api и postgres возвращаются сами (ReplicaSet и оператор соответственно); rolling update — без единого потерянного запроса, сломанная версия не роняет сервис и откатывается `helm rollback`;
+- при падении control plane `shop` продолжает отвечать и обрабатывать заказы, после восстановления кластер снова управляем (с поправкой на пару минут, пока поднимаются вебхуки);
+- дашборд и 3 алерта поверх стека из лабы 2.
