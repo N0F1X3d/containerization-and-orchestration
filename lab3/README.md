@@ -147,3 +147,60 @@ Kubernetes постоянно сравнивает желаемое состоя
 
 - **readiness vs liveness.** Обе пробы выполняет **kubelet** на ноде, обе смотрят на `/health`, но последствия разные. Провалилась **readiness** → `Ready=false` → под убирают из Endpoints сервиса, трафик на него не идёт, контейнер не трогают. Провалилась **liveness** (у нас 6 раз подряд по 10 с) → kubelet **перезапускает контейнер** — поэтому у сломанного пода `RESTARTS 2`. Readiness — «можно ли слать трафик», liveness — «жив ли процесс или его пора перезапустить».
 - **Почему сломанная версия не уронила сервис.** Две настройки вместе: **readiness-проба** (сломанный под так и не стал Ready) и **`maxUnavailable: 0`** (Deployment не имеет права гасить старый под, пока новый не Ready). Новый не готов → старые не трогаются → rollout просто стоит, сервис работает на старых. Без readiness Kubernetes считал бы под готовым сразу после старта контейнера — rollout заменил бы все 5 старых подов на сломанные, и сервис лёг бы целиком.
+
+## Часть 3 — postgres через оператор
+
+Оператор — свой контроллер + свой тип объекта (CRD). Поставил **CloudNativePG** один раз на кластер:
+
+```bash
+helm install cnpg cnpg/cloudnative-pg --version 0.29.1 -n cnpg-system --create-namespace --wait
+helm upgrade shop charts/shop -n shop --reuse-values --set postgres.enabled=true
+```
+
+В чарт добавил шаблон [`postgres.yaml`](charts/shop/templates/postgres.yaml) — объект `Cluster` (`postgresql.cnpg.io/v1`): 1 экземпляр, образ `ghcr.io/cloudnative-pg/postgresql:18.1`, диск 1Gi, база и владелец `shop`. Чтобы поды оператора прошли политики — `inheritedMetadata` с нужными метками (их оператор проставляет на свои поды), `resources` из values, образ из доверенного `ghcr.io/cloudnative-pg/`.
+
+![база готова](screenshots/10_part3_db_ready.png)
+
+`Cluster in healthy state`, заказ создан и через полсекунды `processed: true` (сработал worker). `api` подхватил базу **без перезапуска** (`RESTARTS 0`) — Secret `shop-db-app` подложился в под томом, сервис прочитал из него адрес.
+
+Что оператор создал из одного объекта:
+
+![что создал оператор](screenshots/13_part3_created_by_operator.png)
+
+Под `shop-db-1`, PVC `shop-db-1` на 1Gi, три сервиса (`-rw` — primary для записи, `-ro` — только реплики, `-r` — любой экземпляр для чтения), четыре секрета (пароль приложения, CA, TLS для сервера и репликации).
+
+### Reconciliation на операторе
+
+Удалил под `shop-db-1` руками:
+
+![под базы вернулся](screenshots/11_part3_db_returns.png)
+
+`Terminating` → `Completed` → снова `Pending` → `Init` → `Running 1/1`, ~20 секунд. Вернул его **оператор**: у postgres-подов нет ни ReplicaSet, ни StatefulSet — оператор сам видит, что в `spec` 1 экземпляр, а подов 0, и создаёт под.
+
+Грабли: в первый раз под возвращался почти 3 минуты — при остановке postgres делает smart shutdown и до 180 с ждёт, пока клиенты (мои `api`) сами отключатся. В бою это бережёт транзакции, для лабы поставил `smartShutdownTimeout: 10`.
+
+### spec и status
+
+![spec и status](screenshots/12_part3_spec_status.png)
+
+- `spec` — **желаемое**, написал я (через чарт): образ, 1 экземпляр, 1Gi;
+- `status` — **наблюдаемое**, пишет оператор: `phase: Cluster in healthy state`, `readyInstances: 1`, `currentPrimary: shop-db-1`.
+
+### Чем оператор отличается от controller-manager
+
+**Общее — механизм.** И `kube-controller-manager`, и оператор — бесконечный цикл reconciliation: посмотреть желаемое (`spec`) → посмотреть реальное → исправить разницу → записать что видишь в `status`. Удалённый под `api` вернул контроллер ReplicaSet (живёт в controller-manager), удалённый под `shop-db-1` — оператор. Один и тот же принцип.
+
+**Разное:**
+
+| | kube-controller-manager | оператор CloudNativePG |
+|---|---|---|
+| откуда | встроен в Kubernetes, часть control plane | ставится отдельно (`helm install cnpg`), работает обычным подом в кластере |
+| какие объекты | стандартные: Deployment, ReplicaSet, Node, Endpoints, Job… | свой новый тип `Cluster` (CRD), которого в Kubernetes не было |
+| что знает | общее: «подов должно быть N» | предметное знание о postgres: initdb, пользователи и пароли, TLS, реплики, корректная остановка, failover primary |
+
+Оператор — тот же контроллер, только сторонний, со своим типом объектов и знаниями о конкретном приложении. Он автоматизирует то, что раньше руками делал DBA.
+
+### Что понял
+
+- **Почему данные пережили удаление пода.** Данные лежат в PVC `shop-db-1`, а не в поде. Под удалили — PVC остался, оператор создал новый под **с тем же именем** и подключил к нему тот же диск. Заказ `book` на месте.
+- **Что будет при `instances: 3`.** Оператор поднимет `shop-db-2` и `shop-db-3` как реплики с потоковой репликацией от primary. Для этого и три сервиса: `-rw` всегда указывает на primary (запись), `-ro` — на реплики (чтение), `-r` — на любой экземпляр. Упадёт primary — оператор сам повысит реплику и перенаправит `-rw` на неё (failover).
